@@ -70,6 +70,14 @@ Cause: in the original `_poll_loop`, only `_fetch_usage()` was inside the `try`.
 
 Fixes applied: the entire loop body is now inside a catch-all so the thread cannot die; the icon-update block has its own inner `try` that swallows Win32 errors; and the tooltip now reports the **age** of the last good read ("read 7m ago"), so a frozen app is immediately visible instead of ambiguous.
 
+## Bug found and fixed 2026-07-24: "Resets unknown" right after a weekly reset
+
+Symptom: just after the 7-day window rolled over for the first time, the 7d tooltip read `Claude 7d weekly usage: 0%` / `Resets unknown`.
+
+Cause: right after a window resets (utilization back to 0, window not yet "active" — the payload's `limits[].is_active` is `false` for it), the endpoint returns `resets_at: null` for that window. The success branch did a blind `_state.update(result)`, so that null overwrote the previously-known reset, and `_format_reset(None)` → `"unknown"`.
+
+Fix: on a good read, a null `*_resets` no longer clobbers the last known value — the cached one is kept. `_format_reset` now takes the window's period and, if the kept reset time has already lapsed, rolls it forward by whole periods (windows reset on a fixed cadence: +7 days weekly, +5h session) to recover the correct next reset without needing a fresh read. `"unknown"` now only shows if a reset value was *never* seen since launch. Cache is in-memory only (consistent with the no-disk-IO decision); a restart in that brief post-reset window is the one case that can still momentarily show "unknown" until the next good read repopulates it.
+
 ## If something breaks later
 
 - **Tooltip says "rate limited, retry in Nm":** expected during heavy Claude Code use — the CLI and this app share one ~5-req/5-min budget. It self-heals; no action needed.

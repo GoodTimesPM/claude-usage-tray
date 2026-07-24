@@ -22,7 +22,12 @@ import os
 import random
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# How long each window lasts, used to roll a known reset time forward when the
+# endpoint temporarily stops reporting one (see _format_reset / the poll loop).
+FIVE_HOUR_PERIOD = 5 * 3600
+SEVEN_DAY_PERIOD = 7 * 24 * 3600
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -103,14 +108,23 @@ def _fetch_usage():
     }
 
 
-def _format_reset(iso_ts):
+def _format_reset(iso_ts, period_seconds=None):
     if not iso_ts:
         return "unknown"
     try:
-        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).astimezone()
-        return dt.strftime("%a %I:%M %p").lstrip("0")
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
     except ValueError:
         return "unknown"
+    # Windows reset on a fixed cadence, so a reset time that has already lapsed
+    # (e.g. the value we last saw before the week rolled over, kept because the
+    # endpoint briefly stopped reporting a new one) can be advanced by whole
+    # periods to recover the correct next reset without a fresh read.
+    if period_seconds:
+        now = datetime.now(timezone.utc)
+        if dt <= now:
+            elapsed = (now - dt).total_seconds()
+            dt += timedelta(seconds=period_seconds * (int(elapsed // period_seconds) + 1))
+    return dt.astimezone().strftime("%a %I:%M %p").lstrip("0")
 
 
 def _severity_color(pct):
@@ -174,8 +188,8 @@ def _tooltips():
         suffix = f"\n{s['error']} - read {age_min}m ago ({s['last_ok']})"
     else:
         suffix = ""
-    tip_5h = f"Claude 5h session usage: {s['five_hour']}%\nResets {_format_reset(s['five_hour_resets'])}{suffix}"
-    tip_7d = f"Claude 7d weekly usage: {s['seven_day']}%\nResets {_format_reset(s['seven_day_resets'])}{suffix}"
+    tip_5h = f"Claude 5h session usage: {s['five_hour']}%\nResets {_format_reset(s['five_hour_resets'], FIVE_HOUR_PERIOD)}{suffix}"
+    tip_7d = f"Claude 7d weekly usage: {s['seven_day']}%\nResets {_format_reset(s['seven_day_resets'], SEVEN_DAY_PERIOD)}{suffix}"
     return tip_5h[:127], tip_7d[:127]
 
 
@@ -192,6 +206,13 @@ def _poll_loop(icon_5h, icon_7d):
             result = _fetch_usage()
             consecutive_failures = 0
             with _state_lock:
+                # The endpoint briefly drops resets_at right after a window rolls
+                # over (utilization 0, window not yet "active"). Don't let that
+                # null wipe the last reset we knew - _format_reset rolls the kept
+                # value forward a period so the tooltip stays correct meanwhile.
+                for key in ("five_hour_resets", "seven_day_resets"):
+                    if result[key] is None:
+                        result[key] = _state[key]
                 _state.update(result)
                 _state["error"] = None
                 _state["last_ok"] = datetime.now().strftime("%I:%M %p").lstrip("0")
