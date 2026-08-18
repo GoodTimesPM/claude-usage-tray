@@ -44,7 +44,27 @@ STALE_AFTER_SECONDS = 900  # only dim the icons after 15 min with no good read
 REQUEST_TIMEOUT = 6
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# Every good read is published here so other local tools can have the numbers
+# without polling the endpoint themselves. The rate limit above is per-account,
+# so a second poller would earn 429s for both of us. This app is the only
+# poller; everything else reads this file. (Colony Dash is the first consumer -
+# see colony-dash/ARCHITECTURE.md 6.2.)
+USAGE_CACHE_PATH = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "claude-usage", "usage.json"
+)
 FONT_PATH = r"C:\Windows\Fonts\arialbd.ttf"
+
+# Same refresh flow Claude Code itself uses (found by grepping claude.exe for
+# "grant_type:\"refresh_token\"" / TOKEN_URL / CLIENT_ID, same technique used
+# to find USAGE_URL). Lets this app refresh its own access token instead of
+# needing Claude Code to be opened once to do it.
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Refresh proactively once less than this much life is left on the access
+# token, so a normal 5-min poll cycle always catches it before it actually
+# expires rather than racing the clock.
+REFRESH_MARGIN_MS = 10 * 60 * 1000
 
 _state_lock = threading.Lock()
 _state = {
@@ -69,18 +89,71 @@ class RateLimited(Exception):
 
 
 class TokenStale(Exception):
-    """401/403 - the locally stored OAuth token is no longer accepted."""
+    """The access token was rejected and refreshing it also failed - the
+    stored refresh token itself is dead, so a real `claude` login is needed."""
 
 
-def _read_access_token():
+def _load_credentials():
     with open(CREDENTIALS_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data["claudeAiOauth"]["accessToken"]
+        return json.load(f)
 
 
-def _fetch_usage():
-    token = _read_access_token()
-    resp = requests.get(
+def _save_credentials(creds):
+    # Atomic write (temp file + os.replace) so a concurrent Claude Code CLI
+    # read never sees a half-written file.
+    tmp_path = CREDENTIALS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(creds, f, indent=2)
+    os.replace(tmp_path, CREDENTIALS_PATH)
+
+
+def _publish_usage(result):
+    """Write the last good read to the shared cache. Best-effort by design: a
+    failure here must never disturb the tray icons, which are the actual job."""
+    try:
+        os.makedirs(os.path.dirname(USAGE_CACHE_PATH), exist_ok=True)
+        payload = dict(result)
+        payload["read_at"] = datetime.now(timezone.utc).isoformat()
+        tmp_path = USAGE_CACHE_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, USAGE_CACHE_PATH)  # atomic; readers never see a partial file
+    except Exception:
+        pass
+
+
+def _refresh_access_token(creds):
+    """Mint a new access token from the stored refresh token and persist it
+    back to the credentials file, same as Claude Code does on its own launch.
+    Raises on failure (network error, or the refresh token itself being dead -
+    that's the one case that still needs a real `claude` login)."""
+    # Verified against the live endpoint (2026-07-27): including "scope" in
+    # this body gets a 400 "Invalid request format" back, even though claude.exe
+    # itself builds a scope field for this same grant_type. Omit it - the
+    # refresh grant works fine without it and returns the account's actual scopes.
+    oauth = creds["claudeAiOauth"]
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": oauth["refreshToken"],
+        "client_id": CLIENT_ID,
+    }
+    resp = requests.post(TOKEN_URL, json=body, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+
+    now_ms = int(time.time() * 1000)
+    oauth["accessToken"] = data["access_token"]
+    oauth["refreshToken"] = data.get("refresh_token", oauth["refreshToken"])
+    oauth["expiresAt"] = now_ms + int(data["expires_in"]) * 1000
+    if "refresh_token_expires_in" in data:
+        oauth["refreshTokenExpiresAt"] = now_ms + int(data["refresh_token_expires_in"]) * 1000
+
+    _save_credentials(creds)
+    return oauth["accessToken"]
+
+
+def _get_usage(token):
+    return requests.get(
         USAGE_URL,
         headers={
             "Authorization": f"Bearer {token}",
@@ -89,14 +162,38 @@ def _fetch_usage():
         timeout=REQUEST_TIMEOUT,
     )
 
+
+def _fetch_usage():
+    creds = _load_credentials()
+    oauth = creds["claudeAiOauth"]
+    now_ms = int(time.time() * 1000)
+
+    if oauth.get("expiresAt", 0) - now_ms < REFRESH_MARGIN_MS:
+        try:
+            _refresh_access_token(creds)
+        except Exception:
+            pass  # fall through on the old token; a real problem surfaces below
+
+    resp = _get_usage(oauth["accessToken"])
+
+    if resp.status_code in (401, 403):
+        # Access token died sooner than expiresAt claimed (or the proactive
+        # refresh above failed transiently) - refresh once and retry before
+        # giving up.
+        try:
+            token = _refresh_access_token(creds)
+        except Exception:
+            raise TokenStale()
+        resp = _get_usage(token)
+        if resp.status_code in (401, 403):
+            raise TokenStale()
+
     if resp.status_code == 429:
         try:
             retry_after = int(resp.headers.get("Retry-After", ""))
         except ValueError:
             retry_after = POLL_SECONDS
         raise RateLimited(retry_after)
-    if resp.status_code in (401, 403):
-        raise TokenStale()
 
     resp.raise_for_status()
     payload = resp.json()
@@ -217,6 +314,8 @@ def _poll_loop(icon_5h, icon_7d):
                 _state["error"] = None
                 _state["last_ok"] = datetime.now().strftime("%I:%M %p").lstrip("0")
                 _state["last_ok_at"] = time.monotonic()
+                published = dict(result)
+            _publish_usage(published)
 
         except RateLimited as exc:
             # Not a malfunction - the shared per-account budget is spent, usually
@@ -231,7 +330,7 @@ def _poll_loop(icon_5h, icon_7d):
             consecutive_failures += 1
             wait = min(POLL_SECONDS * 2 ** min(consecutive_failures, 3), MAX_POLL_SECONDS)
             with _state_lock:
-                _state["error"] = "token stale - run Claude Code once"
+                _state["error"] = "login expired - run 'claude' to sign in again"
 
         except Exception as exc:
             consecutive_failures += 1

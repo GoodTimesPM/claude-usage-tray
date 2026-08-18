@@ -2,7 +2,7 @@
 
 Windows system tray app that shows two live Claude Pro usage percentages, always visible, no clicking/hovering required.
 
-## Status: working, installed, running (rate-limit handling added 2026-07-23)
+## Status: working, installed, running (self-refreshing OAuth token added 2026-07-27)
 
 ## What it does
 
@@ -17,10 +17,18 @@ Hovering either icon shows exact % and reset time in the tooltip. Right-click me
 
 `GET https://api.anthropic.com/api/oauth/usage`, authenticated with the OAuth **access token already stored locally** at `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`), header `anthropic-beta: oauth-2025-04-20`.
 
-This endpoint was found by grepping strings out of the installed `claude.exe` binary (`/api/oauth/usage`, plus response field paths `rate_limits.five_hour.used_percentage` / `rate_limits.seven_day.used_percentage`) — it's the same endpoint the Claude Code CLI itself calls to power its own "approaching usage limit" warnings. It is **not** public API documentation, so:
+This endpoint was found by grepping strings out of the installed `claude.exe` binary (`/api/oauth/usage`, plus response field paths `rate_limits.five_hour.used_percentage` / `rate_limits.seven_day.used_percentage`) — it's the same endpoint the Claude Code CLI itself calls to power its own "approaching usage limit" warnings. It is **not** public API documentation, so it could change or disappear without notice if Anthropic reshapes the endpoint.
 
-- It could change or disappear without notice if Anthropic reshapes the endpoint.
-- The app does **not** manage OAuth refresh itself — it just re-reads the token from the credentials file on every poll. As long as Claude Code is used periodically (which keeps that file's token fresh), this keeps working. If the token in that file goes stale and Claude Code isn't run to refresh it, the tray icons will show stale data with a dimmed color and the tooltip will say so — no crash, no retry storm.
+### Self-managed OAuth refresh (added 2026-07-27)
+
+The app now refreshes its own access token instead of depending on Claude Code being run periodically to keep `~/.claude/.credentials.json` fresh. Same technique as finding the usage endpoint: the refresh request shape (`TOKEN_URL`, `CLIENT_ID`, body `{grant_type: "refresh_token", refresh_token, client_id}`) was found by grepping `claude.exe` for `grant_type:"refresh_token"` / `TOKEN_URL` / `CLIENT_ID`.
+
+- Before every poll, if the stored `expiresAt` has less than `REFRESH_MARGIN_MS` (10 min) left, the app refreshes proactively.
+- If a poll still gets 401/403 anyway (token died early, or the proactive refresh failed transiently), it refreshes once more and retries before giving up.
+- A successful refresh is written back to `~/.claude/.credentials.json` (atomic temp-file + `os.replace`, so a concurrent Claude Code CLI read never sees a half-written file) — this keeps Claude Code itself working too, not just the tray app.
+- `TokenStale` now only fires when the refresh grant *itself* fails (the stored refresh token is actually dead) — that's the one case still needing a real `claude` login. Tooltip message: "login expired - run 'claude' to sign in again".
+- **Important - do not test this refresh call against the live credentials file with a throwaway script that discards the response.** Refresh tokens rotate on use: the old refresh token becomes invalid the moment the server issues a new one, whether or not you save it. A discarded test call quietly killed the working refresh token once during development (2026-07-27) and forced a real `/login`. Always test through `_refresh_access_token()` itself (which persists atomically) — never a bare POST that throws the response away.
+- Verified live (2026-07-27): including a `scope` field in the refresh body gets `400 Invalid request format` even though `claude.exe`'s own code builds one for this grant type — omit it, the grant works and returns the account's real scopes anyway.
 
 ### Rate limit on this endpoint (measured 2026-07-23)
 
@@ -78,10 +86,30 @@ Cause: right after a window resets (utilization back to 0, window not yet "activ
 
 Fix: on a good read, a null `*_resets` no longer clobbers the last known value — the cached one is kept. `_format_reset` now takes the window's period and, if the kept reset time has already lapsed, rolls it forward by whole periods (windows reset on a fixed cadence: +7 days weekly, +5h session) to recover the correct next reset without needing a fresh read. `"unknown"` now only shows if a reset value was *never* seen since launch. Cache is in-memory only (consistent with the no-disk-IO decision); a restart in that brief post-reset window is the one case that can still momentarily show "unknown" until the next good read repopulates it.
 
+## Added 2026-08-17: this app is now the machine's only usage poller
+
+Every good read is published to `%LOCALAPPDATA%\claude-usage\usage.json` (`_publish_usage`),
+written to a temp file and `os.replace`d so a reader never sees a partial file. The payload
+is the poll result plus a UTC `read_at`.
+
+**Why:** the endpoint's ~5-req/5-min budget is per *account* and shared with the Claude Code
+CLI, so a second tool polling it independently would earn 429s for both and freeze these
+icons on stale numbers. Other local tools read the file instead. First consumer is
+[Colony Dash](../../colony-dash/PROJECT.md), whose hourly pulse samples it into its ledger
+(`colony-dash/ARCHITECTURE.md` §6.2).
+
+This is the one deliberate exception to the original no-disk-IO decision, and it's scoped to
+match: one small write per successful poll, wrapped in a bare `except` so a disk failure can
+never disturb the tray icons, which remain the actual job.
+
+**Restarted 2026-08-17 21:10** and verified: `usage.json` appeared on the first poll
+(`five_hour: 32, seven_day: 18`, plus both reset times and a UTC `read_at`), and Colony
+Dash's next pulse read it successfully.
+
 ## If something breaks later
 
 - **Tooltip says "rate limited, retry in Nm":** expected during heavy Claude Code use — the CLI and this app share one ~5-req/5-min budget. It self-heals; no action needed.
-- **Tooltip says "token stale - run Claude Code once":** the token in `~/.claude/.credentials.json` was rejected (401/403). Open Claude Code once to force a refresh, then "Refresh now" from the tray menu.
+- **Tooltip says "login expired - run 'claude' to sign in again":** the app already tried refreshing the token itself and the *refresh token* was rejected too — that only happens if the stored refresh token is actually dead (e.g. revoked, or expired past `refreshTokenExpiresAt`). Run `claude` once to do a real login, then "Refresh now" from the tray menu.
 - **Icons show "?" / gray, tooltip says unavailable:** no successful read has happened at all since launch — check the credentials file exists and is readable.
 - **Numbers frozen but no error in tooltip:** check the "read Nm ago" age. If it keeps climbing, the poll thread died despite the catch-all — restart the app and investigate.
 - **Endpoint stops working (404/shape change):** re-derive it the same way it was found — grep `claude.exe` for `usage`/`ratelimit` strings — Anthropic may have moved or restructured it.
