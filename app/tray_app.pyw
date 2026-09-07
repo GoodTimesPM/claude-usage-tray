@@ -7,9 +7,10 @@ Shows two tray icons, each a single big number:
   - "7d" icon = current 7-day (weekly) limit utilization %
 
 Data comes from Anthropic's account usage endpoint, using the OAuth token
-Claude Code already stores locally in ~/.claude/.credentials.json. This is
-the same endpoint/token the Claude Code CLI itself uses to power its own
-usage warnings - we're just reading our own account's own status.
+Claude Code already stores locally in ~/.claude/.credentials.json. That is the
+same endpoint and the same token the Claude Code CLI uses for its own usage
+warnings, so this reads your own account's status with your own credentials.
+Nothing leaves the machine except that one request to Anthropic.
 
 Design goals: near-zero idle resource use. A single background thread wakes
 every POLL_SECONDS, makes one small HTTPS GET, and updates both icons. The
@@ -33,27 +34,55 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 
+def _env_int(name, default, minimum=None):
+    """Read an int setting from the environment, ignoring anything unparseable."""
+    try:
+        value = int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
 # The usage endpoint allows roughly 5 requests per rolling 5 minutes, and the
 # Claude Code CLI itself spends from that same per-account budget. Polling any
-# faster than the window just starves the CLI and earns 429s, so we sit at one
-# poll per window and leave the rest of the budget to the CLI.
-POLL_SECONDS = 300
+# faster than the window starves the CLI and earns 429s, so this sits at one
+# poll per window and leaves the rest of the budget to the CLI. Lowering
+# CLAUDE_TRAY_POLL_SECONDS below 300 is how you break both.
+POLL_SECONDS = _env_int("CLAUDE_TRAY_POLL_SECONDS", 300, minimum=60)
 MIN_POLL_SECONDS = 60
 MAX_POLL_SECONDS = 1800
 STALE_AFTER_SECONDS = 900  # only dim the icons after 15 min with no good read
 REQUEST_TIMEOUT = 6
-CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
-# Every good read is published here so other local tools can have the numbers
-# without polling the endpoint themselves. The rate limit above is per-account,
-# so a second poller would earn 429s for both of us. This app is the only
-# poller; everything else reads this file. (Colony Dash is the first consumer -
-# see colony-dash/ARCHITECTURE.md 6.2.)
-USAGE_CACHE_PATH = os.path.join(
+# Claude Code keeps its credentials in ~/.claude unless CLAUDE_CONFIG_DIR moves
+# them, so honour the same variable rather than assuming the home directory.
+CLAUDE_CONFIG_DIR = os.environ.get(
+    "CLAUDE_CONFIG_DIR", os.path.join(os.path.expanduser("~"), ".claude")
+)
+CREDENTIALS_PATH = os.environ.get(
+    "CLAUDE_TRAY_CREDENTIALS", os.path.join(CLAUDE_CONFIG_DIR, ".credentials.json")
+)
+
+# Every good read is published here so other local tools can read the numbers
+# without polling the endpoint themselves. The rate limit above is per account,
+# so a second poller earns 429s for both of them. Run this app as the only
+# poller and let everything else read this file.
+USAGE_CACHE_PATH = os.environ.get("CLAUDE_TRAY_CACHE") or os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "claude-usage", "usage.json"
 )
-FONT_PATH = r"C:\Windows\Fonts\arialbd.ttf"
+
+# The number has to survive Windows downscaling a 64px icon to 16px, which needs
+# a heavy weight. First font that loads wins; Pillow's built-in bitmap font is
+# the last resort and looks like one.
+FONT_CANDIDATES = [
+    os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "Fonts", name)
+    for name in ("arialbd.ttf", "seguisb.ttf", "segoeuib.ttf", "calibrib.ttf", "verdanab.ttf")
+]
+if os.environ.get("CLAUDE_TRAY_FONT"):
+    FONT_CANDIDATES.insert(0, os.environ["CLAUDE_TRAY_FONT"])
 
 # Same refresh flow Claude Code itself uses (found by grepping claude.exe for
 # "grant_type:\"refresh_token\"" / TOKEN_URL / CLIENT_ID, same technique used
@@ -239,10 +268,13 @@ _FONT_CACHE = {}
 
 def _get_font(size):
     if size not in _FONT_CACHE:
-        try:
-            _FONT_CACHE[size] = ImageFont.truetype(FONT_PATH, size)
-        except OSError:
-            _FONT_CACHE[size] = ImageFont.load_default()
+        _FONT_CACHE[size] = ImageFont.load_default()
+        for path in FONT_CANDIDATES:
+            try:
+                _FONT_CACHE[size] = ImageFont.truetype(path, size)
+                break
+            except OSError:
+                continue
     return _FONT_CACHE[size]
 
 
