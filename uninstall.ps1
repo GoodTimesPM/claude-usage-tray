@@ -1,5 +1,12 @@
-# Removes the startup shortcut and stops any running instance.
-# Does not uninstall pystray/Pillow/requests (harmless to leave; re-run install_startup.ps1 to reinstall).
+<#
+.SYNOPSIS
+    Remove the Startup shortcut and stop the running tray app.
+
+.DESCRIPTION
+    Leaves pystray, Pillow and requests installed; they are harmless, and
+    install.ps1 needs them again if you change your mind. Delete the repo
+    folder afterwards to be rid of it entirely.
+#>
 
 $startupDir = [Environment]::GetFolderPath("Startup")
 $shortcutPath = Join-Path $startupDir "Claude Usage Tray.lnk"
