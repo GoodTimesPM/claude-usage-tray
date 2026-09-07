@@ -2,7 +2,7 @@
 
 Windows system tray app that shows two live Claude Pro usage percentages, always visible, no clicking/hovering required.
 
-## Status: working, installed, running (self-refreshing OAuth token added 2026-07-27)
+## Status: working, running, published to GitHub as `claude-usage-tray` (2026-09-07)
 
 ## What it does
 
@@ -48,19 +48,21 @@ Response shape actually returned (verified 2026-07-22):
 ## Why this design (decisions made 2026-07-22)
 
 - **Two separate tray icons, not one.** Tried a single icon with both numbers stacked — illegible at real Windows tray size (16px on standard DPI; only readable at 32px+). A single big number per icon reads clearly at 16px, confirmed by rendering + downscaling test.
-- **Python + pystray + Pillow + requests, not C#/.NET or Electron.** No .NET SDK was installed on this machine and winget isn't available either, so a compiled C# tray app would've needed an SDK install first. Python 3.12 was already present. Electron was ruled out on resource-use grounds per Jordan's explicit ask. `pystray`'s Windows backend is native Win32 (Shell_NotifyIcon), event-driven, not polled — idle cost is just the poll thread's sleep.
-- **5-minute poll interval** (`POLL_SECONDS` in `app/tray_app.pyw`). Originally 3 minutes (Jordan asked for "1 or 5, whichever is the sweet spot" — split the difference), but that was set before the endpoint's ~5-req/5-min budget was known, and it starved the Claude Code CLI of the shared allowance. Now pinned to one poll per rate-limit window. **Do not lower this** without re-measuring the limit.
+- **Python + pystray + Pillow + requests, not C#/.NET or Electron.** No .NET SDK was installed on this machine and winget isn't available either, so a compiled C# tray app would've needed an SDK install first. Python 3.12 was already present. Electron was ruled out on resource-use grounds. `pystray`'s Windows backend is native Win32 (Shell_NotifyIcon), event-driven, not polled — idle cost is just the poll thread's sleep.
+- **5-minute poll interval** (`POLL_SECONDS` in `app/tray_app.pyw`, overridable with `CLAUDE_TRAY_POLL_SECONDS`). Originally 3 minutes, but that was set before the endpoint's ~5-req/5-min budget was known, and it starved the Claude Code CLI of the shared allowance. Now pinned to one poll per rate-limit window. **Do not lower this** without re-measuring the limit.
 - **429 is handled as a first-class outcome, not an error** (added 2026-07-23). On 429 the app waits exactly the server's `Retry-After` plus 5-30s of jitter (so it doesn't resync with whatever else is spending the budget), and does *not* count it toward failure backoff. Other failures use exponential backoff up to 30 min. `401/403` is called out separately in the tooltip as "token stale - run Claude Code once", since that one has a specific user fix.
 - **Icons only dim after 15 min without a good read** (`STALE_AFTER_SECONDS`), not on the first failed poll. A single 429 is expected during heavy CLI use and shouldn't make the tray look broken when the numbers are still seconds old.
 - **No persistent logging.** Deliberately not writing to disk every cycle — avoids unnecessary I/O for a background app that's supposed to be invisible resource-wise.
-- **Launch mechanism: Startup folder shortcut**, not a registry Run key or scheduled task. Chosen so Jordan can kill it instantly and visibly by deleting one `.lnk` file if it ever causes problems — matches his stated "if I notice performance issues I'm deleting it."
+- **Launch mechanism: Startup folder shortcut**, not a registry Run key or scheduled task. Chosen so the app can be killed instantly and visibly by deleting one `.lnk` file if it ever causes problems.
 
 ## Files
 
 - `app/tray_app.pyw` — the whole app (single file, no console window since it's `.pyw` run via `pythonw.exe`)
-- `app/requirements.txt` — `pystray`, `Pillow`, `requests` (all installed via `pip install --user`, already present on this machine as of 2026-07-22)
-- `install_startup.ps1` — creates the Startup-folder shortcut (safe to re-run)
-- `uninstall_startup.ps1` — removes the shortcut and kills any running instance
+- `requirements.txt` — `pystray`, `Pillow`, `requests`
+- `install.ps1` — installs the dependencies, creates the Startup-folder shortcut, starts the app (safe to re-run)
+- `uninstall.ps1` — removes the shortcut and kills any running instance
+- `README.md` — the public front page
+- `docs/icons.png` — the three icon states, regenerated from `_make_number_icon` rather than screenshotted
 
 ## Verified working (2026-07-22)
 
@@ -95,8 +97,8 @@ is the poll result plus a UTC `read_at`.
 **Why:** the endpoint's ~5-req/5-min budget is per *account* and shared with the Claude Code
 CLI, so a second tool polling it independently would earn 429s for both and freeze these
 icons on stale numbers. Other local tools read the file instead. First consumer is
-[Colony Dash](../../colony-dash/PROJECT.md), whose hourly pulse samples it into its ledger
-(`colony-dash/ARCHITECTURE.md` §6.2).
+[Colony Dash](https://github.com/GoodTimesPM/colony-dash), whose hourly pulse samples it
+into its ledger (its `ARCHITECTURE.md` §6.2).
 
 This is the one deliberate exception to the original no-disk-IO decision, and it's scoped to
 match: one small write per successful poll, wrapped in a bare `except` so a disk failure can
@@ -113,5 +115,34 @@ Dash's next pulse read it successfully.
 - **Icons show "?" / gray, tooltip says unavailable:** no successful read has happened at all since launch — check the credentials file exists and is readable.
 - **Numbers frozen but no error in tooltip:** check the "read Nm ago" age. If it keeps climbing, the poll thread died despite the catch-all — restart the app and investigate.
 - **Endpoint stops working (404/shape change):** re-derive it the same way it was found — grep `claude.exe` for `usage`/`ratelimit` strings — Anthropic may have moved or restructured it.
-- **To change poll frequency:** edit `POLL_SECONDS` in `app/tray_app.pyw` — but see the rate-limit section above; going below 300s trips 429s and steals budget from the Claude Code CLI.
-- **To fully remove:** run `uninstall_startup.ps1`, then delete this folder.
+- **To change poll frequency:** set `CLAUDE_TRAY_POLL_SECONDS` — but see the rate-limit section above; going below 300s trips 429s and steals budget from the Claude Code CLI.
+- **To fully remove:** run `uninstall.ps1`, then delete this folder.
+
+## Published 2026-09-07
+
+Public at [github.com/GoodTimesPM/claude-usage-tray](https://github.com/GoodTimesPM/claude-usage-tray),
+MIT, pushed by `publish-claude-usage-tray.ps1` from the projects root. It is
+this project's own script, modelled on the colony-dash one but not sharing code
+with it: same `git subtree split` mechanism, its own folder, its own remote, its
+own audit patterns (the credential-shaped ones matter more here, since this app
+reads `.credentials.json`).
+
+What changed to make it publishable:
+
+- **Every hardcoded path became a setting.** `CLAUDE_CONFIG_DIR` (Claude Code's
+  own variable) locates the credentials file, `CLAUDE_TRAY_CREDENTIALS`
+  overrides it outright, `CLAUDE_TRAY_CACHE` moves `usage.json`, and
+  `CLAUDE_TRAY_FONT` replaces the number font. Defaults are unchanged, so the
+  running install and Colony Dash's reader were unaffected.
+- **The font is a candidate list, not `C:\Windows\Fontsrialbd.ttf`.** It
+  resolves `%SystemRoot%` and falls through Arial Bold, Segoe UI Semibold,
+  Calibri Bold, Verdana Bold, then Pillow's default. Arial Bold ships with
+  Windows, but the old code silently degraded to an unreadable bitmap font on a
+  machine without it.
+- `install_startup.ps1`/`uninstall_startup.ps1` became `install.ps1` /
+  `uninstall.ps1`, and install now does the `pip install` and starts the app
+  instead of printing a command to copy.
+- The README is upfront that the usage endpoint is undocumented and was found
+  by grepping `claude.exe`, that it can vanish, and that this is not affiliated
+  with Anthropic. Publishing something that leans on an internal endpoint
+  without saying so would be the actual problem.
