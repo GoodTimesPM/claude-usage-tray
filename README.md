@@ -30,25 +30,29 @@ You need Windows, Python 3.9 or newer on PATH, and Claude Code signed in on
 this machine (this app reads the token Claude Code already stored, it has no
 login of its own).
 
+Download the [latest release](https://github.com/GoodTimesPM/claude-usage-tray/archive/refs/heads/main.zip)
+and extract it, or clone it:
+
 ```powershell
 git clone https://github.com/GoodTimesPM/claude-usage-tray.git
 cd claude-usage-tray
-.\install.ps1
 ```
 
-That installs `pystray`, `Pillow` and `requests` for your user, puts a shortcut
-in your Startup folder, and starts the app. Two numbers appear in the tray
-within a few seconds.
+Then double-click **`Install.cmd`**. A console window opens, installs
+`pystray`, `Pillow` and `requests` for your user, puts a shortcut in your
+Startup folder, and starts the app. Two numbers appear in the tray within a
+few seconds. Close the window once it says done.
+
+(`Install.cmd` also clears the "downloaded from the internet" flag Windows
+puts on files pulled from a zip, then runs `install.ps1` for you. If you'd
+rather run PowerShell yourself: `.\install.ps1` from a terminal opened in this
+folder — just don't double-click `install.ps1` directly, Windows opens `.ps1`
+files in an editor instead of running them.)
 
 Right-click either icon for `Refresh now` and `Quit`. Hover for the exact
 percentage and the reset time.
 
-To remove it:
-
-```powershell
-.\uninstall.ps1
-```
-
+To remove it, double-click **`Uninstall.cmd`** (or run `.\uninstall.ps1`).
 That deletes the shortcut and stops the process. The Startup folder is the
 launch mechanism on purpose. It is one visible file you can delete, rather than
 a registry key or a scheduled task you have to go looking for.
