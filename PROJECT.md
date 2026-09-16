@@ -146,3 +146,31 @@ What changed to make it publishable:
   by grepping `claude.exe`, that it can vanish, and that this is not affiliated
   with Anthropic. Publishing something that leans on an internal endpoint
   without saying so would be the actual problem.
+
+## Second-machine install, 2026-09-15
+
+Installing from the published repo onto a different machine broke in two ways
+that never showed up here, because here the repo folder is a git checkout that
+Windows trusts:
+
+- **Double-clicking `install.ps1` opens it in an editor**, it does not run it.
+  Windows has no run-on-double-click association for `.ps1`, by design.
+- **Files extracted from the GitHub zip carry the mark-of-the-web flag**, so
+  even a deliberate `.\install.ps1` is blocked.
+
+Fix: `Install.cmd` and `Uninstall.cmd`, which `.cmd` *does* run on double-click.
+Each one `Unblock-File`s the folder recursively, then calls its `.ps1` with
+`-NoProfile -ExecutionPolicy Bypass`, and pauses so the window stays readable.
+The `.ps1` scripts are unchanged and still work from a terminal. README now
+leads with the zip download and the double-click, and says outright not to
+double-click the `.ps1`.
+
+That commit was made on the other machine, directly in a clone of the public
+repo, and brought back here by replaying its diff into this folder with the
+original author and committer dates. `git subtree split` then reproduced commit
+`871301d` byte-identically, so the published branch and this folder lined up
+again with no drift for `publish-claude-usage-tray.ps1` to complain about.
+**If you ever
+commit to the public repo again, bring it back the same way** — a plain local
+commit would produce a different hash, and the publish script's drift guard
+would refuse to push until it was sorted out.
